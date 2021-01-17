@@ -24,10 +24,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use log::{debug, error, trace};
+use log::{debug, trace, warn};
 use rppal::{
     gpio::Level,
-    gpio::{Gpio, InputPin},
+    gpio::Gpio,
     i2c::I2c,
 };
 
@@ -128,6 +128,81 @@ fn poll_rpi_tmp(sensors: Arc<Sensors>) -> Result<DropJoin<()>> {
     Ok(DropJoin::new(handle))
 }
 
+fn poll_rpm(sensors: Arc<Sensors>) -> Result<DropJoin<()>> {
+    let gpio = Gpio::new()?;
+
+    let handle = thread::Builder::new()
+        .name("rpm-counter".into())
+        .stack_size(32 * 1024)
+        .spawn(move || {
+            let pin0 = gpio.get(17)?.into_input_pullup();
+            let pin1 = gpio.get(27)?.into_input_pullup();
+
+            use thread_priority::*;
+
+            let tid = thread_native_id();
+            let policy = ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo);
+            let params = ScheduleParams {
+                sched_priority: 20 as _,
+            };
+
+            if let Err(_) = set_thread_schedule_policy(tid, policy, params) {
+                warn!("Thread scheduling policy change failed");
+            };
+
+            for cluster in [0, 1].iter().cycle() {
+                let input = match cluster {
+                    0 => &pin0,
+                    1 | _ => &pin1,
+                };
+
+                let mut changes = 0;
+                let start = std::time::Instant::now();
+                let mut before = input.read();
+
+                for _ in 0..199 {
+                    // We start by doing an extra sample outside of the loop hence 199 not 200
+                    // This is not going to be exact on any system with a scheduler
+                    // but thats life, no-one is gonna die if your FAN rpm is slightly off.
+                    std::thread::sleep(Duration::from_millis(5));
+
+                    let current = input.read();
+
+                    if current != before {
+                        // We only care if it went from high to low
+                        if current == Level::Low {
+                            changes += 1;
+                        }
+                        before = current;
+                    }
+                }
+
+                // try to fix the number by measuring how much time we actually sampled
+                let sample_window = start.elapsed().as_secs_f64();
+                let freq = changes as f64 * sample_window;
+                let rpm = (freq / 2.0) * 60.0;
+
+                trace!(
+                    "{:?}, RPM: {:.0}, sample_window: {}",
+                    cluster,
+                    rpm,
+                    sample_window
+                );
+
+                match cluster {
+                    0 => sensors.set(&SensorId::RPM0, rpm),
+                    1 | _ => sensors.set(&SensorId::RPM1, rpm)
+                };
+
+                std::thread::sleep(Duration::from_secs(3));
+            }
+
+            Ok(())
+        })?;
+
+    Ok(DropJoin::new(handle))
+}
+
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy)]
 enum SensorId {
     Tmp0,
@@ -137,8 +212,8 @@ enum SensorId {
 
     RPi,
 
+    RPM0,
     RPM1,
-    RPM2,
 
     Virtual(usize),
 }
@@ -155,8 +230,8 @@ impl SensorId {
 
             4 => RPi,
 
-            5 => RPM1,
-            6 => RPM2,
+            5 => RPM0,
+            6 => RPM1,
 
             nr => Virtual(nr),
         }
@@ -173,8 +248,8 @@ impl SensorId {
 
             RPi => 4,
 
-            RPM1 => 5,
-            RPM2 => 6,
+            RPM0 => 5,
+            RPM1 => 6,
 
             Virtual(nr) => nr,
         }
@@ -206,7 +281,7 @@ impl Sensors {
 
             for park_id in v.followers.iter().chain(std::iter::once(&0)) {
                 // Iterate trough the listeners and unpark them, 0 is always unparked special case for listening to all
-                debug!("Unparking {}", park_id);
+                trace!("Unparking {}", park_id);
                 unsafe {
                     parking_lot_core::unpark_all(*park_id, parking_lot_core::UnparkToken(key));
                 }
@@ -232,7 +307,7 @@ impl Sensors {
 
         debug!("New follow with id {}", follow.0);
 
-        SensorIterator::new(follow.0, keys)
+        SensorIterator::new(follow.0)
     }
 
     fn next_slot(&self) -> Result<usize> {
@@ -255,12 +330,11 @@ impl Sensors {
 
 struct SensorIterator {
     id: usize,
-    sensors: Vec<SensorId>,
 }
 
 impl SensorIterator {
-    pub fn new(id: usize, sensors: Vec<SensorId>) -> SensorIterator {
-        SensorIterator { id, sensors }
+    pub fn new(id: usize) -> SensorIterator {
+        SensorIterator { id }
     }
 }
 
@@ -268,7 +342,7 @@ impl Iterator for SensorIterator {
     type Item = SensorId;
 
     fn next(&mut self) -> Option<Self::Item> {
-        debug!("Parking {}", self.id);
+        trace!("Parking {}", self.id);
 
         let res = unsafe {
             parking_lot_core::park(
@@ -282,7 +356,9 @@ impl Iterator for SensorIterator {
         };
 
         match res {
-            parking_lot_core::ParkResult::Unparked(parking_lot_core::UnparkToken(token)) => Some(SensorId::from_usize(token)),
+            parking_lot_core::ParkResult::Unparked(parking_lot_core::UnparkToken(token)) => {
+                Some(SensorId::from_usize(token))
+            }
             _ => None,
         }
     }
@@ -392,8 +468,9 @@ fn main() -> Result<()> {
 
     let _tmp_handle = poll_tmp_probes(sensors.clone())?;
     let _rpi_handle = poll_rpi_tmp(sensors.clone())?;
+    let _rpm_handle = poll_rpm(sensors.clone())?;
 
-    let iter0 = sensors.follow(vec![SensorId::Tmp0, SensorId::RPi]);
+    let iter0 = sensors.follow(vec![SensorId::Tmp0, SensorId::RPi, SensorId::RPM0, SensorId::RPM1]);
 
     for v in iter0 {
         println!("{:?}", v);
