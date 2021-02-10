@@ -1,200 +1,143 @@
-/*
-mod components;
-mod postman;
+mod drop;
+mod net;
 mod pwm;
 mod sensor;
-mod supervisor;
-mod tenk;
-*/
-
-mod pwm;
-
-/*
-
-use postman::Postman;
-use pwm::Pwm;
-
-use sensor::Sensors;
-use supervisor::Supervisor;
-
-use components::{Net, Rpm, Temperature, Virt};
-*/
 
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
-
-use log::{debug, trace, warn};
-use rppal::{
-    gpio::Level,
-    gpio::Gpio,
-    i2c::I2c,
-};
 
 use anyhow::Result;
+use clap::{App, Arg};
+use drop::DropJoin;
+use once_cell::sync::OnceCell;
+use tokio::net::TcpListener;
 
-enum Channel {
-    A0,
-    A1,
-    A2,
-    A3,
+use pwm::Pwm;
+use sensor::{builtin::*, SensorId, SensorMessage, Sensors};
+
+pub trait Global {
+    fn global() -> &'static Self;
 }
 
-fn poll_tmp_probes(sensors: Arc<Sensors>) -> Result<DropJoin<()>> {
-    let mut i2c = rppal::i2c::I2c::new()?;
-
-    // Default addres when the Adc addr pin is connection to GND
-    i2c.set_slave_address(0b1001000)?;
-
-    let handle = thread::Builder::new()
-        .name("temp-sensor".into())
-        .stack_size(32 * 1024)
-        .spawn(move || loop {
-            let t0 = read_adc(&mut i2c, Channel::A0)?;
-            sensors.set(&SensorId::Tmp0, t0);
-
-            let t1 = read_adc(&mut i2c, Channel::A1)?;
-            sensors.set(&SensorId::Tmp1, t1);
-
-            let t2 = read_adc(&mut i2c, Channel::A2)?;
-            sensors.set(&SensorId::Tmp2, t2);
-
-            let t3 = read_adc(&mut i2c, Channel::A3)?;
-            sensors.set(&SensorId::Tmp3, t3);
-
-            thread::sleep(Duration::from_secs(1));
-        })?;
-
-    Ok(DropJoin::new(handle))
-}
-
-// Override Steinhart-Hart coeff
-// Tool: https://www.thinksrs.com/downloads/programs/Therm%20Calc/NTCCalibrator/NTCcalculator.htm
-fn read_adc(i2c: &mut I2c, channel: Channel) -> Result<f64> {
-    // Only difference is which channel, so multiplex config
-    // See: https://cdn-shop.adafruit.com/datasheets/ads1115.pdf for specs
-
-    match channel {
-        Channel::A0 => i2c.write(&[0b00000001, 0b11000011, 0b11100011])?,
-        Channel::A1 => i2c.write(&[0b00000001, 0b11010011, 0b11100011])?,
-        Channel::A2 => i2c.write(&[0b00000001, 0b11100011, 0b11100011])?,
-        Channel::A3 => i2c.write(&[0b00000001, 0b11110011, 0b11100011])?,
+macro_rules! global {
+    ($target:ty, $name:ident) => {
+        static $name: OnceCell<$target> = OnceCell::new();
+        impl Global for $target {
+            fn global() -> &'static Self {
+                $name.get().unwrap()
+            }
+        }
     };
-
-    // Wait time = nominal data period + 10%+ 20μs
-    // And we're at 860SPS so 1.16ms
-    thread::sleep(Duration::from_micros(1300));
-
-    // The measured resistance of the low-side resistor in the voltage divider
-    let low_side_res = 10_000.0;
-
-    // These are standard for 10k termistors.
-    // should be calibrated by end user if they know how
-    let sh_a = 0.001125308852122;
-    let sh_b = 0.000234711863267;
-    let sh_c = 0.000000085663516;
-
-    let mut res = [0u8; 2];
-    i2c.write_read(&[0b00000000], &mut res)?;
-
-    let value = i16::from_be_bytes(res);
-
-    let volt = value as f64;
-    // Gettings the correct voltage is simply INadc * Vgain / 2^15
-    // And we can constant fold the second part of that
-    let volt = volt * 1.2500e-4;
-    let term_res = 3.3 * low_side_res / volt - low_side_res;
-
-    let log_res = term_res.ln();
-    let temp = 1.0 / (sh_a + sh_b * log_res + sh_c * log_res.powi(3)) - 273.15;
-
-    Ok(temp)
 }
 
-fn poll_rpi_tmp(sensors: Arc<Sensors>) -> Result<DropJoin<()>> {
-    let handle = thread::Builder::new()
-        .name("rpi-sensor".into())
-        .stack_size(32 * 1024)
-        .spawn(move || loop {
-            let temp = std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp")?;
-            let temp = temp.trim().parse::<f64>()?;
-            let temp = temp / 1000.0;
+pub const VERSION: &'static str = "0.0.1";
 
-            sensors.set(&SensorId::RPi, temp);
+global!(Sensors, SENSORS);
+global!(Config, CONFIG);
+global!(sled::Db, DB);
+global!(Workers, WORKERS);
 
-            thread::sleep(Duration::from_secs(3));
-        })?;
+fn main() -> Result<()> {
+    env_logger::init();
 
-    Ok(DropJoin::new(handle))
-}
+    let matches = App::new("Nino")
+        .version(VERSION)
+        .about("Control the RPi pwm controller hat")
+        .arg(
+            Arg::new("name")
+                .long("name")
+                .short('n')
+                .about("The instance name of the Nino server")
+                .required(true)
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("retention")
+                .short('r')
+                .about("The number of sensor values the server will store for each sensor")
+                .takes_value(true),
+        )
+        .get_matches();
 
-fn poll_rpm(sensors: Arc<Sensors>) -> Result<DropJoin<()>> {
-    let gpio = Gpio::new()?;
+    SENSORS.set(Sensors::new()).unwrap();
+    CONFIG.set(Config {
+        name: matches.value_of("name").unwrap().into(),
+        retention: matches.value_of_t("retention").unwrap_or(100),
+    }).unwrap();
+    DB.set(sled::open("./settings.db")?).unwrap();
+    WORKERS.set(Default::default()).unwrap();
 
-    let handle = thread::Builder::new()
-        .name("rpm-counter".into())
-        .stack_size(32 * 1024)
-        .spawn(move || {
-            let pin0 = gpio.get(17)?.into_input_pullup();
-            let pin1 = gpio.get(27)?.into_input_pullup();
+    let workers = Workers::global();
 
-            use thread_priority::*;
+    Sensors::global().load_saved()?;
 
-            let tid = thread_native_id();
-            let policy = ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo);
-            let params = ScheduleParams {
-                sched_priority: 20 as _,
-            };
+    {
+        // Start built in sensor workers
+        let mut wrk = workers
+            .lock()
+            .expect("Could not lock sensor workers lock");
 
-            if let Err(_) = set_thread_schedule_policy(tid, policy, params) {
-                warn!("Thread scheduling policy change failed");
-            };
+        wrk.push((
+            vec![
+                SensorId::Tmp0,
+                SensorId::Tmp1,
+                SensorId::Tmp2,
+                SensorId::Tmp3,
+            ],
+            poll_tmp_probes()?,
+        ));
 
-            for cluster in [0, 1].iter().cycle() {
-                let input = match cluster {
-                    0 => &pin0,
-                    1 | _ => &pin1,
-                };
+        wrk.push((vec![SensorId::RPi], poll_rpi_tmp()?));
+        wrk.push((vec![SensorId::RPM0, SensorId::RPM1], poll_rpm()?));
+    }
 
-                let mut changes = 0;
-                let start = std::time::Instant::now();
-                let mut before = input.read();
+    let (tx, _rx) = tokio::sync::broadcast::channel(5);
+    let broadcaster = Arc::new(tx);
+    let _broadcast_handle = broadcast_sensors(broadcaster.clone())?;
 
-                for _ in 0..199 {
-                    // We start by doing an extra sample outside of the loop hence 199 not 200
-                    // This is not going to be exact on any system with a scheduler
-                    // but thats life, no-one is gonna die if your FAN rpm is slightly off.
-                    std::thread::sleep(Duration::from_millis(5));
+    let pwm = Pwm::new()?;
+    pwm.set_channel0(0.6)?;
+    pwm.set_channel1(0.28)?;
 
-                    let current = input.read();
+    let rt = tokio::runtime::Runtime::new()?;
+    let _ok: Result<()> = rt.block_on(async {
+        let listener = TcpListener::bind("0.0.0.0:7583").await?;
 
-                    if current != before {
-                        // We only care if it went from high to low
-                        if current == Level::Low {
-                            changes += 1;
-                        }
-                        before = current;
+        loop {
+            // The second item contains the IP and port of the new connection.
+            let (socket, addr) = listener.accept().await?;
+
+            log::debug!("{:?} connected", addr);
+
+            let listen = broadcaster.clone();
+
+            tokio::spawn(async move {
+                match net::handle(socket, listen).await {
+                    Ok(_) => return,
+                    Err(e) => {
+                        log::error!("Socket error:\n{:?}", e);
+                        return;
                     }
                 }
+            });
+        }
+    });
 
-                // try to fix the number by measuring how much time we actually sampled
-                let sample_window = start.elapsed().as_secs_f64();
-                let freq = changes as f64 * sample_window;
-                let rpm = (freq / 2.0) * 60.0;
+    _ok
+}
 
-                trace!(
-                    "{:?}, RPM: {:.0}, sample_window: {}",
-                    cluster,
-                    rpm,
-                    sample_window
-                );
+fn broadcast_sensors(
+    broadcast: Arc<tokio::sync::broadcast::Sender<SensorMessage>>,
+) -> Result<DropJoin<()>> {
+    let handle = std::thread::Builder::new()
+        .name("broadcaster".into())
+        .stack_size(32 * 1024)
+        .spawn(move || {
+            let sensors = Sensors::global();
 
-                match cluster {
-                    0 => sensors.set(&SensorId::RPM0, rpm),
-                    1 | _ => sensors.set(&SensorId::RPM1, rpm)
-                };
-
-                std::thread::sleep(Duration::from_secs(3));
+            for message in sensors.subscribe() {
+                if let Err(m) = broadcast.send(message) {
+                    log::error!("Error forwarding sensor data {}", m);
+                }
             }
 
             Ok(())
@@ -203,357 +146,20 @@ fn poll_rpm(sensors: Arc<Sensors>) -> Result<DropJoin<()>> {
     Ok(DropJoin::new(handle))
 }
 
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy)]
-enum SensorId {
-    Tmp0,
-    Tmp1,
-    Tmp2,
-    Tmp3,
+#[derive(Default, Debug)]
+struct Workers(std::sync::Mutex<Vec<(Vec<SensorId>, DropJoin<()>)>>);
 
-    RPi,
+impl std::ops::Deref for Workers {
+    type Target = std::sync::Mutex<Vec<(Vec<SensorId>, DropJoin<()>)>>;
 
-    RPM0,
-    RPM1,
-
-    Virtual(usize),
-}
-
-impl SensorId {
-    fn from_usize(nr: usize) -> SensorId {
-        use SensorId::*;
-
-        match nr {
-            0 => Tmp0,
-            1 => Tmp1,
-            2 => Tmp2,
-            3 => Tmp3,
-
-            4 => RPi,
-
-            5 => RPM0,
-            6 => RPM1,
-
-            nr => Virtual(nr),
-        }
-    }
-
-    fn to_usize(self) -> usize {
-        use SensorId::*;
-
-        match self {
-            Tmp0 => 0,
-            Tmp1 => 1,
-            Tmp2 => 2,
-            Tmp3 => 3,
-
-            RPi => 4,
-
-            RPM0 => 5,
-            RPM1 => 6,
-
-            Virtual(nr) => nr,
-        }
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-struct Sensor {
-    name: String,
-    value: f64,
-    followers: Vec<usize>,
-}
 
-struct Sensors {
-    sensor_storage: dashmap::DashMap<usize, Sensor>,
-
-    // Subscription stuff
-    park_slots: std::sync::Mutex<Vec<usize>>,
-    follow_cache: dashmap::DashMap<Vec<SensorId>, (usize, usize)>,
-}
-
-impl Sensors {
-    pub fn set(&self, key: &SensorId, value: f64) {
-        let key = key.to_usize();
-
-        if let Some(mut v) = self.sensor_storage.get_mut(&key) {
-            trace!("Sensor {:?} = {:?}", key, value);
-
-            v.value = value; // Set the value in the heap
-
-            for park_id in v.followers.iter().chain(std::iter::once(&0)) {
-                // Iterate trough the listeners and unpark them, 0 is always unparked special case for listening to all
-                trace!("Unparking {}", park_id);
-                unsafe {
-                    parking_lot_core::unpark_all(*park_id, parking_lot_core::UnparkToken(key));
-                }
-            }
-        }
-    }
-
-    pub fn follow(&self, mut keys: Vec<SensorId>) -> SensorIterator {
-        keys.sort();
-
-        let mut follow = self
-            .follow_cache
-            .entry(keys.clone())
-            .or_insert_with(|| (self.next_slot().unwrap(), 0));
-        follow.1 += 1;
-
-        for key in keys.iter().map(|k| k.to_usize()) {
-            self.sensor_storage.alter(&key, |_, mut sensor| {
-                sensor.followers.push(follow.0);
-                sensor
-            });
-        }
-
-        debug!("New follow with id {}", follow.0);
-
-        SensorIterator::new(follow.0)
-    }
-
-    fn next_slot(&self) -> Result<usize> {
-        let mut slots = self.park_slots.lock().unwrap();
-
-        let slot = match slots.as_slice() {
-            &[] => Some(1),
-            &[1] => Some(2),
-            list => list.windows(2).find(|s| s[1] != s[0] + 1).map(|s| s[0] + 1),
-        };
-
-        if let Some(slot) = slot {
-            slots.insert(slot - 1, slot);
-            Ok(slot)
-        } else {
-            Err(anyhow::anyhow!("Could not find a new park slot"))
-        }
-    }
-}
-
-struct SensorIterator {
-    id: usize,
-}
-
-impl SensorIterator {
-    pub fn new(id: usize) -> SensorIterator {
-        SensorIterator { id }
-    }
-}
-
-impl Iterator for SensorIterator {
-    type Item = SensorId;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        trace!("Parking {}", self.id);
-
-        let res = unsafe {
-            parking_lot_core::park(
-                self.id,
-                || true,
-                || {},
-                |_, _| {},
-                parking_lot_core::DEFAULT_PARK_TOKEN,
-                None,
-            )
-        };
-
-        match res {
-            parking_lot_core::ParkResult::Unparked(parking_lot_core::UnparkToken(token)) => {
-                Some(SensorId::from_usize(token))
-            }
-            _ => None,
-        }
-    }
-}
-
-impl Default for Sensors {
-    fn default() -> Self {
-        let sensor_storage = dashmap::DashMap::new();
-
-        sensor_storage.insert(
-            0,
-            Sensor {
-                name: "Tmp0".into(),
-                value: 0.0,
-                followers: vec![],
-            },
-        );
-        sensor_storage.insert(
-            1,
-            Sensor {
-                name: "Tmp1".into(),
-                value: 0.0,
-                followers: vec![],
-            },
-        );
-        sensor_storage.insert(
-            2,
-            Sensor {
-                name: "Tmp2".into(),
-                value: 0.0,
-                followers: vec![],
-            },
-        );
-        sensor_storage.insert(
-            3,
-            Sensor {
-                name: "Tmp3".into(),
-                value: 0.0,
-                followers: vec![],
-            },
-        );
-
-        sensor_storage.insert(
-            4,
-            Sensor {
-                name: "RPi".into(),
-                value: 0.0,
-                followers: vec![],
-            },
-        );
-
-        sensor_storage.insert(
-            5,
-            Sensor {
-                name: "RPM1".into(),
-                value: 0.0,
-                followers: vec![],
-            },
-        );
-        sensor_storage.insert(
-            6,
-            Sensor {
-                name: "RPM2".into(),
-                value: 0.0,
-                followers: vec![],
-            },
-        );
-
-        Sensors {
-            sensor_storage,
-            park_slots: std::sync::Mutex::new(vec![]),
-            follow_cache: dashmap::DashMap::new(),
-        }
-    }
-}
-
-struct DropJoin<T> {
-    handle: Option<std::thread::JoinHandle<Result<T>>>,
-}
-
-impl<T> DropJoin<T> {
-    pub fn new(handle: std::thread::JoinHandle<Result<T>>) -> DropJoin<T> {
-        DropJoin {
-            handle: Some(handle),
-        }
-    }
-}
-
-impl<T> Drop for DropJoin<T> {
-    fn drop(&mut self) {
-        if let Some(inner) = self.handle.take() {
-            let res = inner
-                .join()
-                .map_err(|e| anyhow::format_err!("{:?}", e))
-                .and_then(|r| r);
-            if res.is_err() && !std::thread::panicking() {
-                res.unwrap();
-            }
-        }
-    }
-}
-
-fn main() -> Result<()> {
-    env_logger::init();
-
-    let sensors = Arc::new(Sensors::default());
-
-    let _tmp_handle = poll_tmp_probes(sensors.clone())?;
-    let _rpi_handle = poll_rpi_tmp(sensors.clone())?;
-    let _rpm_handle = poll_rpm(sensors.clone())?;
-
-    let iter0 = sensors.follow(vec![SensorId::Tmp0, SensorId::RPi, SensorId::RPM0, SensorId::RPM1]);
-
-    for v in iter0 {
-        println!("{:?}", v);
-    }
-
-    /*
-    let temp = Temp::register(sensors.clone());
-    let temp_handle = temp.start()?;
-    */
-
-    // sensors.get("tmp0");
-    //let tmp1 = sensors.get("tmp1").unwrap().clone();
-    //let tmp2 = sensors.get("tmp2").unwrap().clone();
-
-    //temp_handle.join().unwrap().unwrap();
-
-    //x2.join().unwrap().unwrap();
-
-    /*
-    let responder = libmdns::Responder::new().unwrap();
-
-    let txt = format!("Mr Freeze|{}", 7);
-    let _svc = responder.register(
-        "_nino._tcp".to_owned(),
-        "mrfreeze".to_owned(),
-        7583,
-        &[&txt],
-    );*/
-    /*
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(async {
-        let listener = TcpListener::bind("0.0.0.0:7583").await.unwrap();
-
-        let mut invalidate_cheap = interval(Duration::from_secs(1));
-        let mut invalidate_expensive = interval(Duration::from_secs(3));
-        let mut duty_cycle = interval(Duration::from_millis(500));
-
-        loop {
-            tokio::select! {
-                _ = invalidate_expensive.next() => {
-                    use Sensor::*;
-                    let mut query = SensorQuery.in_db_mut(db.as_mut());
-
-                    query.invalidate(&Rpm0);
-                    query.invalidate(&Rpm1);
-                    query.invalidate(&Rpi);
-
-                    let query = SensorQuery.in_db(db.as_ref());
-                    query.sweep(SweepStrategy::discard_outdated());
-                },
-                _ = invalidate_cheap.next() => {
-                    use Sensor::*;
-                    let mut query = SensorQuery.in_db_mut(db.as_mut());
-
-                    query.invalidate(&Temp0);
-                    query.invalidate(&Temp1);
-                    query.invalidate(&Temp2);
-                    query.invalidate(&Temp3);
-
-                    let query = SensorQuery.in_db(db.as_ref());
-                    query.sweep(SweepStrategy::discard_outdated());
-                },
-                _ = duty_cycle.next() => {
-                    let pwm0 = db.duty_cycle(0);
-                    println!("Duty cycle {}", pwm0);
-                },
-                _socket = listener.accept() => {
-                    println!("got socket");
-                }
-            };
-        }
-    });*/
-
-    /*let pwm = pwm::Pwm::new().unwrap();
-
-    loop {
-        let mut buffer = String::new();
-        std::io::stdin().read_line(&mut buffer).unwrap();
-        pwm.set_channel0(buffer.trim().parse().unwrap()).unwrap();
-    }*/
-
-    Ok(())
+#[derive(Default, Debug)]
+pub struct Config {
+    pub name: String,
+    pub retention: usize,
 }

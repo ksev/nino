@@ -1,0 +1,14 @@
+[Unit]
+Description=Nino
+After=network.target
+
+[Service]
+ExecStart=/home/pi/nino/nino --name MrFreeze
+WorkingDirectory=/home/pi/nino
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+User=pi
+
+[Install]
+WantedBy=multi-user.target

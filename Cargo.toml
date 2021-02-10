@@ -10,13 +10,21 @@ edition = "2018"
 anyhow = "1.0.33"
 log = "0.4"
 env_logger = "0.8.1"
-thread-priority = "0.2.0"
 sled = "0.34.4"
 serde = { version = "1.0.117", features = ["derive"] }
-rhai = { version = "0.19.3", features = ["no_module", "only_i32"] }
+rhai = { version = "0.19.11", features = ["no_module", "only_i32"] }
 bincode = "1.3.1"
 dashmap = "3.11.10"
-parking_lot_core = "0.8.0"
+crossbeam-channel = "0.5.0"
+once_cell = "1.5.2"
+prost = "0.7.0"
+tokio = { version = "1.0", features = ["full"] }
+
+[target.'cfg(unix)'.dependencies.thread-priority]
+version = "0.2.0"
+
+[target.'cfg(windows)'.dependencies.rand]
+version = "0.8.2"
 
 [target.'cfg(target_arch = "arm")'.dependencies.rppal]
 version = "0.11.3"
@@ -25,6 +33,9 @@ version = "0.11.3"
 version = "3.0.0-beta.2"
 default-features = false
 features = ["std"]
+
+[build-dependencies]
+prost-build = { version = "0.7.0" }
 
 [profile.release]
 opt-level = 3

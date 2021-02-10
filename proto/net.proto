@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package nino.net;
+
+message Hello {
+    string version = 1;
+    string name = 2; // 
+    fixed32 retention = 3; // The number of data points the server stores for each sensor
+}
+
+message Sensors {
+    message Sensor {
+        fixed32 id = 1; // The sensors id, sensor 0-6 are builtin hardwired sensors
+        string alias = 2; // Pretty name for the sensor
+        string unit = 3; // The unit of the data the sensor is reading
+        fixed32 rate = 6; // How many milliseconds a part the values will be approximately
+        repeated double values = 7; // Retained number of values
+        
+        oneof optional_source {
+            string source = 8;
+        }
+        oneof optional_error {
+            string error = 9;
+        }
+    }
+    repeated Sensor sensors = 1;
+}
+
+message SensorConfig {
+    fixed32 id = 1; // The id of the sensor
+    string alias = 2; // Pretty name for the sensor
+    string unit = 3; // The unit of the data the sensor is reading
+
+    oneof optional_rate {
+        fixed32 rate = 6; // For virtual sensor we can sate the max rate
+    }
+    oneof optional_source {
+        string source = 7; // For virtual sensors they have Rhai source code
+    }
+}
+
+message Value {
+    fixed32 id = 1;
+    double value = 2;
+}
