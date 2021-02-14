@@ -1,4 +1,11 @@
-use std::{cell::RefCell, collections::{HashSet, VecDeque}, convert::TryInto, rc::Rc, thread, time::Instant};
+use std::{
+    cell::RefCell,
+    collections::{HashSet, VecDeque},
+    convert::TryInto,
+    rc::Rc,
+    thread,
+    time::Instant,
+};
 
 #[cfg(target_arch = "arm")]
 pub mod builtin;
@@ -16,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use anyhow::Result;
 use log;
 
-use crate::{Global, Workers, drop::DropJoin, Config};
+use crate::{drop::DropJoin, Config, Global, Workers};
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy)]
 pub enum SensorId {
@@ -295,13 +302,15 @@ impl Sensors {
         }
     }
 
-    pub fn reconfigure(&self, key: &SensorId, alias: String, unit: String, rate: Option<usize>, source: Option<String>) {
-        log::trace!(
-            "Reconfig {:?}, alias={}, unit={}",
-            key,
-            alias,
-            unit,
-        );
+    pub fn reconfigure(
+        &self,
+        key: &SensorId,
+        alias: String,
+        unit: String,
+        rate: Option<usize>,
+        source: Option<String>,
+    ) {
+        log::trace!("Reconfig {:?}, alias={}, unit={}", key, alias, unit,);
 
         if let Some(mut s) = self.sensor_storage.get_mut(key) {
             s.alias = alias;
@@ -473,8 +482,7 @@ fn start_virtual_worker(id: SensorId) {
                     sensors.clear_error(&id);
                 }
                 SensorMessage::Update(s, _value)
-                    if (dependecies.borrow().contains(&s)
-                        || dependecies.borrow().is_empty())
+                    if (dependecies.borrow().contains(&s) || dependecies.borrow().is_empty())
                         && last.elapsed().as_millis() > rate =>
                 {
                     dependecies.borrow_mut().clear();
@@ -510,4 +518,3 @@ fn start_virtual_worker(id: SensorId) {
     let mut wrk = Workers::global().lock().expect("Cant lock sensor workers");
     wrk.push((vec![id], DropJoin::new(handle)));
 }
-

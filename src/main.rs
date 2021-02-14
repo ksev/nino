@@ -3,7 +3,7 @@ mod net;
 mod pwm;
 mod sensor;
 
-use std::sync::Arc;
+use std::{convert::TryInto, sync::Arc};
 
 use anyhow::Result;
 use clap::{App, Arg};
@@ -94,9 +94,9 @@ fn main() -> Result<()> {
     let broadcaster = Arc::new(tx);
     let _broadcast_handle = broadcast_sensors(broadcaster.clone())?;
 
-    let pwm = Pwm::new()?;
-    pwm.set_channel0(0.6)?;
-    pwm.set_channel1(0.28)?;
+    let (pwm_tx, pwm_rx) = crossbeam_channel::unbounded();
+
+    let _pwm_handle = listen_pwm(pwm_rx)?;
 
     let rt = tokio::runtime::Runtime::new()?;
     let _ok: Result<()> = rt.block_on(async {
@@ -109,9 +109,10 @@ fn main() -> Result<()> {
             log::debug!("{:?} connected", addr);
 
             let listen = broadcaster.clone();
+            let pwm = pwm_tx.clone();
 
             tokio::spawn(async move {
-                match net::handle(socket, listen).await {
+                match net::handle(socket, listen, pwm).await {
                     Ok(_) => return,
                     Err(e) => {
                         log::error!("Socket error:\n{:?}", e);
@@ -142,6 +143,53 @@ fn broadcast_sensors(
 
             Ok(())
         })?;
+
+    Ok(DropJoin::new(handle))
+}
+
+pub enum PwmChannel {
+    Pwm0,
+    Pwm1,
+}
+
+fn listen_pwm(recv: crossbeam_channel::Receiver<(PwmChannel, f32)>) -> Result<DropJoin<()>> {
+    let handle = std::thread::Builder::new().name("pwm".into()).spawn(move || {
+        let database = sled::Db::global();
+
+        let def0 = database.get("pwm0").ok().flatten().and_then(|v| {
+            let value: &[u8] = &v;
+            let value = f32::from_be_bytes(value.try_into().ok()?);
+            Some(value)
+        }).unwrap_or(0.6);
+
+        let def1 = database.get("pwm1").ok().flatten().and_then(|v| {
+            let value: &[u8] = &v;
+            let value = f32::from_be_bytes(value.try_into().ok()?);
+            Some(value)
+        }).unwrap_or(0.28);
+
+        let pwm = Pwm::new()?;
+        pwm.set_channel0(def0)?;
+        pwm.set_channel1(def1)?;
+
+        for (chan, value) in recv.iter() {
+            let v = value.to_be_bytes();
+
+            match chan {
+                PwmChannel::Pwm0 => {
+                    pwm.set_channel0(value.clamp(0.0, 1.0))?;
+                    database.insert("pwm0".as_bytes(), &v)?;
+                },
+                PwmChannel::Pwm1 => {
+                    pwm.set_channel1(value.clamp(0.0, 1.0))?;
+                    database.insert("pwm1".as_bytes(), &v)?;
+                },
+            }
+
+        }
+
+        Ok(())
+    })?;
 
     Ok(DropJoin::new(handle))
 }

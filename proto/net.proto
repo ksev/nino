@@ -6,6 +6,8 @@ message Hello {
     string version = 1;
     string name = 2; // 
     fixed32 retention = 3; // The number of data points the server stores for each sensor
+    float pwm0 = 4;
+    float pwm1 = 5;
 }
 
 message Sensors {
@@ -42,4 +44,13 @@ message SensorConfig {
 message Value {
     fixed32 id = 1;
     double value = 2;
+}
+
+message SetPwm {
+    enum Channel {
+        Pwm0 = 0;
+        Pwm1 = 1;
+    }
+    Channel channel = 1;
+    float value = 2;
 }
